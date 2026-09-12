@@ -16,6 +16,14 @@ GitHub 全站反向代理（单文件 Python 实现，无需 nginx / 无第三�
 
 支持通过 HTTP 代理访问上游（沙箱等需要走 egress 代理的环境）：
   设置环境变量 UPSTREAM_PROXY=http://127.0.0.1:18080 即可。
+
+可靠性改进（v1.1）：
+  - 上游瞬时断连/5xx 自动重试（指数退避），避免偶发 502 导致页面“裸奔”
+  - 内容指纹固定的静态资源（CSS/JS/字体/头像）做内存缓存，
+    二次访问零上游请求，消除并发拉取导致的连接被掐断、样式时有时无
+  - 客户端断连（BrokenPipe）不再让工作线程崩溃
+  - 重写 JSON 里转义形式的 https:\/\/... 链接
+  - 健康检查端点 GET /__health__
 """
 import gzip
 import http.server
@@ -24,6 +32,8 @@ import re
 import socketserver
 import ssl
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 import zlib
@@ -37,6 +47,12 @@ UPSTREAM_PROXY = os.environ.get('UPSTREAM_PROXY', '').strip()
 SELF_SCHEME = os.environ.get('SELF_SCHEME', 'http').strip()
 DEFAULT_HOST = os.environ.get('SELF_HOST', 'localhost:{}'.format(LISTEN_PORT))
 TIMEOUT = float(os.environ.get('TIMEOUT', '60'))
+# 上游瞬时错误重试次数
+RETRY_TIMES = int(os.environ.get('RETRY_TIMES', '3'))
+# 静态资源内存缓存（CACHE_DISABLE=1 可关）
+CACHE_ENABLED = os.environ.get('CACHE_DISABLE', '').lower() not in ('1', 'true', 'yes')
+CACHE_MAX = int(os.environ.get('CACHE_MAX', '2000'))
+CACHE_TTL = float(os.environ.get('CACHE_TTL', str(12 * 3600)))
 
 # 路径前缀 -> 上游域名（路由表）
 DOMAIN_ROUTES = {
@@ -46,7 +62,7 @@ DOMAIN_ROUTES = {
     '__codeload__':         'codeload.github.com',
     '__avatars__':          'avatars.githubusercontent.com',
     '__objects__':          'objects.githubusercontent.com',
-    '__gistassets__':      'gist-assets.githubusercontent.com',
+    '__gistassets__':       'gist-assets.githubusercontent.com',
     '__userimages__':       'user-images.githubusercontent.com',
     '__privateuserimages__':'private-user-images.githubusercontent.com',
     '__releases__':         'github-releases.githubusercontent.com',
@@ -60,18 +76,28 @@ DOMAIN_ROUTES = {
 DOMAIN_TO_PREFIX = [
     ('gist-assets.githubusercontent.com',         '__gistassets__'),
     ('private-user-images.githubusercontent.com','__privateuserimages__'),
-    ('github-releases.githubusercontent.com',    '__releases__'),
-    ('user-images.githubusercontent.com',        '__userimages__'),
-    ('objects.githubusercontent.com',            '__objects__'),
-    ('avatars.githubusercontent.com',            '__avatars__'),
-    ('raw.githubusercontent.com',                '__raw__'),
-    ('github.githubassets.com',                  '__assets__'),
-    ('codeload.github.com',                      '__codeload__'),
-    ('api.github.com',                           '__api__'),
-    ('docs.github.com',                          '__docs__'),
-    ('gist.github.com',                          '__gist__'),
-    ('github.com',                               ''),
+    ('github-releases.githubusercontent.com',      '__releases__'),
+    ('user-images.githubusercontent.com',          '__userimages__'),
+    ('objects.githubusercontent.com',              '__objects__'),
+    ('avatars.githubusercontent.com',              '__avatars__'),
+    ('raw.githubusercontent.com',                  '__raw__'),
+    ('github.githubassets.com',                   '__assets__'),
+    ('codeload.github.com',                       '__codeload__'),
+    ('api.github.com',                            '__api__'),
+    ('docs.github.com',                           '__docs__'),
+    ('gist.github.com',                           '__gist__'),
+    ('github.com',                                ''),
 ]
+
+# 哪些上游域名的 GET 响应可以安全缓存（内容按路径指纹固定，不含个性化会话）
+CACHEABLE_HOSTS = {
+    'github.githubassets.com',
+    'avatars.githubusercontent.com',
+    'camo.githubusercontent.com',
+    'user-images.githubusercontent.com',
+    'private-user-images.githubusercontent.com',
+    'objects.githubusercontent.com',
+}
 
 HOP_BY_HOP = {
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -95,13 +121,62 @@ TEXT_RE = re.compile(
     r'|application/(javascript|json|xml|x-javascript|ecmascript|atom)',
     re.I,
 )
+# 可缓存资源的 Content-Type（CSS/JS/字体/图片/二进制对象）
+CACHEABLE_CT_RE = re.compile(
+    r'text/(css|javascript)|application/(javascript|octet-stream)'
+    r'|font/|image/',
+    re.I,
+)
 
 UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
 
+# ---------------- 内存缓存 ----------------
+_asset_cache = {}          # key -> (expire_ts, status, [(k,v)], body)
+_cache_lock = threading.Lock()
+_start_ts = time.time()
+
+
+def _cache_key(upstream_host, upstream_path):
+    return upstream_host + upstream_path
+
+
+def cache_get(key):
+    with _cache_lock:
+        item = _asset_cache.get(key)
+        if not item:
+            return None
+        expire_ts, status, headers, body = item
+        if expire_ts < time.time():
+            _asset_cache.pop(key, None)
+            return None
+        return status, headers, body
+
+
+def cache_put(key, status, headers, body):
+    if not CACHE_ENABLED or status != 200:
+        return
+    with _cache_lock:
+        if len(_asset_cache) >= CACHE_MAX:
+            # 淘汰最老的一条（dict 按插入序）
+            try:
+                oldest = next(iter(_asset_cache))
+                _asset_cache.pop(oldest, None)
+            except StopIteration:
+                pass
+        _asset_cache[key] = (time.time() + CACHE_TTL, status, headers, body)
+
+
+# ---------------- URL 重写 ----------------
+def _esc(text):
+    """把 http://host 转成 JSON 里合法的转义形式 http:\/\/host。"""
+    return text.replace('/', '\\/')
+
+
 def rewrite_text(text, self_url, self_host):
     """重写响应体文本里的 GitHub 绝对 URL -> 走代理。"""
+    # 1) 普通形式 https://domain 与协议相对 //domain
     for domain, prefix in DOMAIN_TO_PREFIX:
         https_src = 'https://' + domain
         proto_src = '//' + domain
@@ -114,6 +189,14 @@ def rewrite_text(text, self_url, self_host):
         # 先替换带 https 的，再替换协议相对 //
         text = text.replace(https_src, https_dst)
         text = text.replace(proto_src, proto_dst)
+    # 2) JSON 转义形式 https:\/\/domain（内嵌在 Next.js props 等 JSON 里）
+    for domain, prefix in DOMAIN_TO_PREFIX:
+        esc_src = 'https:\\/\\/' + domain
+        if prefix:
+            esc_dst = _esc(self_url) + '\\/' + prefix
+        else:
+            esc_dst = _esc(self_url)
+        text = text.replace(esc_src, esc_dst)
     return text
 
 
@@ -152,9 +235,28 @@ def build_opener():
 OPENER = build_opener()
 
 
+def upstream_request(req):
+    """请求上游，瞬时错误自动重试。返回 (resp, error)。"""
+    for attempt in range(RETRY_TIMES):
+        try:
+            return OPENER.open(req, timeout=TIMEOUT), None
+        except urllib.error.HTTPError as e:
+            # 5xx 且还有重试机会则重试；4xx 直接返回
+            if getattr(e, 'code', 0) >= 500 and attempt < RETRY_TIMES - 1:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            return e, None
+        except Exception as e:  # noqa: BLE001 —— 连接被掐断/超时等
+            if attempt < RETRY_TIMES - 1:
+                time.sleep(0.2 * (attempt + 1))
+            else:
+                return None, e
+    return None, None
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    server_version = 'gh-mirror/1.0'
+    server_version = 'gh-mirror/1.1'
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[proxy] %s %s\n" % (self.address_string(), fmt % args))
@@ -171,22 +273,53 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         host = self.headers.get('Host') or DEFAULT_HOST
         return ('{}://{}'.format(SELF_SCHEME, host), host)
 
+    def _safe_send(self, data):
+        """客户端可能已断开，写失败静默忽略。"""
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
     def _send_simple(self, code, msg):
         body = msg.encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
         if self.command != 'HEAD':
-            self.wfile.write(body)
+            self._safe_send(body)
 
     def _handle(self, method):
         self_url, self_host = self._self_urls()
 
+        # 健康检查端点
+        path_only = self.path.split('?', 1)[0]
+        if path_only == '/__health__':
+            import json
+            payload = json.dumps({
+                'status': 'ok',
+                'uptime_s': round(time.time() - _start_ts, 1),
+                'cached_entries': len(_asset_cache),
+                'upstream_proxy': bool(UPSTREAM_PROXY),
+            }).encode('utf-8')
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self._safe_send(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         # 解析路径前缀，确定上游域名；保留 query
         upstream_host = 'github.com'
         upstream_path = self.path
-        path_only = self.path.split('?', 1)[0]
         for prefix, domain in DOMAIN_ROUTES.items():
             full_pfx = '/' + prefix
             if path_only == full_pfx:
@@ -210,6 +343,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 body = None
 
+        # 命中静态资源缓存（GET 且上游域名可缓存）直接回源，不走上游
+        cache_key = None
+        cached = None
+        if method == 'GET' and upstream_host in CACHEABLE_HOSTS:
+            cache_key = _cache_key(upstream_host, upstream_path)
+            cached = cache_get(cache_key)
+            if cached:
+                status, headers, out = cached
+                self._respond(status, headers, out, method)
+                return
+
         url = 'https://{}{}'.format(upstream_host, upstream_path)
         req = urllib.request.Request(url, data=body, method=method)
         for key, val in self.headers.items():
@@ -224,12 +368,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         req.add_header('Accept-Encoding', 'gzip, deflate')
         req.add_header('User-Agent', self.headers.get('User-Agent') or UA)
 
-        try:
-            resp = OPENER.open(req, timeout=TIMEOUT)
-        except urllib.error.HTTPError as e:
-            resp = e  # HTTPError 也可 read()，含 status/headers
-        except Exception as e:
-            self._send_simple(502, 'upstream error: {}'.format(e))
+        resp, err = upstream_request(req)
+        if err is not None:
+            self._send_simple(502, 'upstream error: {}'.format(err))
             return
 
         try:
@@ -268,25 +409,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         else:
             out = raw
 
-        self.send_response(status)
-        sent = set()
+        # 收集要回传的响应头（重写 location / cookie）
+        resp_headers = []
         for key, val in resp.headers.items():
             k = key.lower()
-            if k in HOP_BY_HOP or k in DROP_RESP_HEADERS or k in sent:
+            if k in HOP_BY_HOP or k in DROP_RESP_HEADERS:
                 continue
             if k == 'location':
                 val = rewrite_location(val, self_url, self_host)
             elif k == 'set-cookie':
                 val = rewrite_cookie(val)
-            self.send_header(key, val)
-            sent.add(k)
-        self.send_header('Content-Length', str(len(out)))
-        self.end_headers()
+            resp_headers.append((k, val))
+
+        # 可缓存资源写入缓存（只缓存 200 的样式/脚本/字体/图片类）
+        if (cache_key is not None and method == 'GET' and status == 200
+                and CACHEABLE_CT_RE.search(ctype)):
+            cache_put(cache_key, status, resp_headers, out)
+
+        self._respond(status, resp_headers, out, method)
+
+    def _respond(self, status, resp_headers, out, method):
+        try:
+            self.send_response(status)
+            sent = set()
+            for k, val in resp_headers:
+                if k in sent:
+                    continue
+                self.send_header(k, val)
+                sent.add(k)
+            self.send_header('Content-Length', str(len(out)))
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
         if method != 'HEAD':
-            try:
-                self.wfile.write(out)
-            except Exception:
-                pass
+            self._safe_send(out)
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -300,6 +456,9 @@ def main():
         LISTEN_HOST, LISTEN_PORT))
     print('  upstream proxy : {}'.format(UPSTREAM_PROXY or 'direct (no proxy)'))
     print('  self scheme    : {}'.format(SELF_SCHEME))
+    print('  asset cache    : {} ({} entries, ttl {:.0f}s)'.format(
+        'on' if CACHE_ENABLED else 'off', CACHE_MAX, CACHE_TTL))
+    print('  retry times    : {}'.format(RETRY_TIMES))
     print('  routes         : github.com + {} sub-domains'.format(len(DOMAIN_ROUTES)))
     sys.stdout.flush()
     try:

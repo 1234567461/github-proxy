@@ -12,6 +12,12 @@
 - **POST / API 透传**：GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS 全方法透传，不阻断
 - **支持 egress 代理**：沙箱等需要走 HTTP 代理才能访问外网的环境，自动用 `https_proxy` 作为上游
 - **附 nginx.conf**：在能直连 GitHub 的服务器上也可用 nginx 方案（性能更好）
+- **可靠性（v1.1）**：
+  - 上游瞬时断连 / 5xx **自动重试**（指数退避），不再因一次抖动就 502
+  - 内容指纹固定的静态资源（CSS/JS/字体/头像）做**内存缓存**，二次访问零上游请求，彻底消除“CSS 时有时无、页面变裸 HTML、图标乱排”
+  - 客户端断连（BrokenPipe）不再崩工作线程
+  - 同时重写 JSON 里转义形式的 `https:\/\/...` 链接
+  - 健康检查端点 `GET /__health__`
 
 ## 一行命令启动
 
@@ -54,6 +60,10 @@ http://localhost:8081/__raw__/torvalds/linux/master/README.md   # raw 文件
 | `SELF_HOST` | `localhost:<port>` | 重写 URL 的 host（默认根据端口生成） |
 | `PYTHON` | `python3` | python 解释器 |
 | `TIMEOUT` | `60` | 上游请求超时(秒) |
+| `RETRY_TIMES` | `3` | 上游瞬时断连/5xx 自动重试次数 |
+| `CACHE_DISABLE` | （空=开） | 设 `1` 关闭静态资源内存缓存 |
+| `CACHE_MAX` | `2000` | 缓存条目上限（最老条目淘汰） |
+| `CACHE_TTL` | `43200` | 静态资源缓存有效期(秒，默认 12h) |
 
 ## 在能联网的 Linux 服务器上用 nginx 方案（可选）
 
@@ -77,7 +87,7 @@ curl -I http://localhost:8081/
 
 在沙箱（无 nginx，通过 `http://127.0.0.1:18080` egress 代理访问 GitHub）实测：
 
-- ✅ `curl -I http://localhost:8081/` → `200 OK`，返回 GitHub 首页 HTML（含 22 处 "github"）
+- ✅ `curl -I http://localhost:8081/` → `200 OK`，返回 GitHub 首页 HTML（含 22 处 “github”）
 - ✅ `curl -s http://localhost:8081/torvalds/linux` → 200，`<title>GitHub - torvalds/linux: Linux kernel source tree</title>`
 - ✅ 静态资源 `http://localhost:8081/__assets__/assets/react-*.js` → 200，`Cache-Control: immutable`
 - ✅ raw 文件 `http://localhost:8081/__raw__/torvalds/linux/master/README` → 200，返回 `Linux kernel ...`

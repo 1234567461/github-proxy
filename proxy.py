@@ -11,19 +11,21 @@ GitHub 全站反向代理（单文件 Python 实现，无需 nginx / 无第三�
   - codeload.github.com               -> /__codeload__
   - avatars / objects / user-images ... 等其他子域
 
-同时重写响应体里的绝对 URL（https://github.com/... -> 走代理），
-让点击链接不跳出代理。POST / API 请求透传不阻断。
+支持 GitHub 登录：
+  - Cookie 自动重写 Domain / Secure / SameSite
+  - 登录流程中所有子域跳转自动重写
+  - CSRF Token / 会话 Cookie 全程透传
 
 支持通过 HTTP 代理访问上游（沙箱等需要走 egress 代理的环境）：
   设置环境变量 UPSTREAM_PROXY=http://127.0.0.1:18080 即可。
 
-可靠性改进（v1.1）：
-  - 上游瞬时断连/5xx 自动重试（指数退避），避免偶发 502 导致页面“裸奔”
-  - 内容指纹固定的静态资源（CSS/JS/字体/头像）做内存缓存，
-    二次访问零上游请求，消除并发拉取导致的连接被掐断、样式时有时无
+可靠性改进（v2.0）：
+  - 上游瞬时断连/5xx 自动重试（指数退避）
+  - 静态资源内存缓存，二次访问零上游请求
   - 客户端断连（BrokenPipe）不再让工作线程崩溃
   - 重写 JSON 里转义形式的 https:\/\/... 链接
   - 健康检查端点 GET /__health__
+  - 支持 GitHub 登录会话保持
 """
 import gzip
 import http.server
@@ -69,10 +71,13 @@ DOMAIN_ROUTES = {
     '__camo__':             'camo.githubusercontent.com',
     '__gist__':             'gist.github.com',
     '__docs__':             'docs.github.com',
+    '__skills__':           'skills.github.com',
+    '__education__':        'education.github.com',
+    '__shop__':             'shop.github.com',
 }
 
 # 域名 -> 路径前缀（响应体重写用）。主站 github.com 前缀为空。
-# 长域名放前面，避免短串先匹配（各域名实际上互不包含，顺序保险）。
+# 长域名放前面，避免短串先匹配。
 DOMAIN_TO_PREFIX = [
     ('gist-assets.githubusercontent.com',         '__gistassets__'),
     ('private-user-images.githubusercontent.com','__privateuserimages__'),
@@ -86,6 +91,9 @@ DOMAIN_TO_PREFIX = [
     ('api.github.com',                            '__api__'),
     ('docs.github.com',                           '__docs__'),
     ('gist.github.com',                           '__gist__'),
+    ('skills.github.com',                         '__skills__'),
+    ('education.github.com',                      '__education__'),
+    ('shop.github.com',                           '__shop__'),
     ('github.com',                                ''),
 ]
 
@@ -110,10 +118,10 @@ DROP_RESP_HEADERS = {
     'x-webkit-csp', 'content-length', 'content-encoding', 'x-xss-protection',
     'report-to', 'nel',
 }
-# 请求头里要丢弃的（host/len 由我们重设；referer/origin 去掉避免被当外站）
+# 请求头里要丢弃的（host/len 由我们重设）
 DROP_REQ_HEADERS = {
     'host', 'content-length', 'accept-encoding', 'proxy-connection',
-    'connection', 'keep-alive', 'via', 'origin', 'referer',
+    'connection', 'keep-alive', 'via',
 }
 
 TEXT_RE = re.compile(
@@ -159,7 +167,6 @@ def cache_put(key, status, headers, body):
         return
     with _cache_lock:
         if len(_asset_cache) >= CACHE_MAX:
-            # 淘汰最老的一条（dict 按插入序）
             try:
                 oldest = next(iter(_asset_cache))
                 _asset_cache.pop(oldest, None)
@@ -186,10 +193,9 @@ def rewrite_text(text, self_url, self_host):
         else:
             https_dst = self_url
             proto_dst = '//' + self_host
-        # 先替换带 https 的，再替换协议相对 //
         text = text.replace(https_src, https_dst)
         text = text.replace(proto_src, proto_dst)
-    # 2) JSON 转义形式 https:\/\/domain（内嵌在 Next.js props 等 JSON 里）
+    # 2) JSON 转义形式 https:\/\/domain
     for domain, prefix in DOMAIN_TO_PREFIX:
         esc_src = 'https:\\/\\/' + domain
         if prefix:
@@ -215,11 +221,16 @@ def rewrite_location(loc, self_url, self_host):
 
 
 def rewrite_cookie(cookie):
-    # 去掉 Domain=.github.com（让 cookie 落到访问的 host）；去 Secure；SameSite=Lax
+    """重写 Cookie：去掉 Domain 属性让 cookie 落到当前 host；
+    去掉 Secure（http 代理下浏览器不会发送 Secure cookie）；
+    SameSite 设为 Lax 允许跨站跳转携带 cookie。"""
+    # 去掉 Domain=.github.com 等
     cookie = re.sub(r';\s*[Dd]omain=[^;]*', '', cookie)
+    # 去掉 Secure 属性
     cookie = re.sub(r';\s*[Ss]ecure\b', '', cookie)
+    # SameSite 统一设为 Lax（允许顶层导航携带 cookie）
     cookie = re.sub(r';\s*[Ss]ameSite=[^;]*', '; SameSite=Lax', cookie)
-    return cookie
+    return cookie.strip()
 
 
 def build_opener():
@@ -241,12 +252,11 @@ def upstream_request(req):
         try:
             return OPENER.open(req, timeout=TIMEOUT), None
         except urllib.error.HTTPError as e:
-            # 5xx 且还有重试机会则重试；4xx 直接返回
             if getattr(e, 'code', 0) >= 500 and attempt < RETRY_TIMES - 1:
                 time.sleep(0.2 * (attempt + 1))
                 continue
             return e, None
-        except Exception as e:  # noqa: BLE001 —— 连接被掐断/超时等
+        except Exception as e:
             if attempt < RETRY_TIMES - 1:
                 time.sleep(0.2 * (attempt + 1))
             else:
@@ -256,7 +266,7 @@ def upstream_request(req):
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    server_version = 'gh-mirror/1.1'
+    server_version = 'gh-mirror/2.0'
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[proxy] %s %s\n" % (self.address_string(), fmt % args))
@@ -274,12 +284,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return ('{}://{}'.format(SELF_SCHEME, host), host)
 
     def _safe_send(self, data):
-        """客户端可能已断开，写失败静默忽略。"""
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def _send_simple(self, code, msg):
@@ -306,6 +315,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 'uptime_s': round(time.time() - _start_ts, 1),
                 'cached_entries': len(_asset_cache),
                 'upstream_proxy': bool(UPSTREAM_PROXY),
+                'version': '2.0',
             }).encode('utf-8')
             try:
                 self.send_response(200)
@@ -329,7 +339,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 break
             elif path_only.startswith(full_pfx + '/'):
                 upstream_host = domain
-                upstream_path = self.path[len(full_pfx):]  # 形如 /xxx?y=1
+                upstream_path = self.path[len(full_pfx):]
                 break
         if not upstream_path.startswith('/'):
             upstream_path = '/' + upstream_path
@@ -343,7 +353,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 body = None
 
-        # 命中静态资源缓存（GET 且上游域名可缓存）直接回源，不走上游
+        # 命中静态资源缓存（GET 且上游域名可缓存）直接回源
         cache_key = None
         cached = None
         if method == 'GET' and upstream_host in CACHEABLE_HOSTS:
@@ -421,7 +431,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 val = rewrite_cookie(val)
             resp_headers.append((k, val))
 
-        # 可缓存资源写入缓存（只缓存 200 的样式/脚本/字体/图片类）
+        # 可缓存资源写入缓存
         if (cache_key is not None and method == 'GET' and status == 200
                 and CACHEABLE_CT_RE.search(ctype)):
             cache_put(cache_key, status, resp_headers, out)
@@ -452,14 +462,16 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
-    print('GitHub reverse proxy listening on http://{}:{} -> github.com'.format(
+    print('GitHub reverse proxy v2.0 (with login support)')
+    print('  listening on  : http://{}:{} -> github.com'.format(
         LISTEN_HOST, LISTEN_PORT))
-    print('  upstream proxy : {}'.format(UPSTREAM_PROXY or 'direct (no proxy)'))
-    print('  self scheme    : {}'.format(SELF_SCHEME))
-    print('  asset cache    : {} ({} entries, ttl {:.0f}s)'.format(
+    print('  upstream proxy: {}'.format(UPSTREAM_PROXY or 'direct (no proxy)'))
+    print('  self scheme   : {}'.format(SELF_SCHEME))
+    print('  asset cache   : {} ({} entries, ttl {:.0f}s)'.format(
         'on' if CACHE_ENABLED else 'off', CACHE_MAX, CACHE_TTL))
-    print('  retry times    : {}'.format(RETRY_TIMES))
-    print('  routes         : github.com + {} sub-domains'.format(len(DOMAIN_ROUTES)))
+    print('  retry times   : {}'.format(RETRY_TIMES))
+    print('  routes        : github.com + {} sub-domains'.format(len(DOMAIN_ROUTES)))
+    print('  login support : enabled (cookie domain rewritten)')
     sys.stdout.flush()
     try:
         server.serve_forever()

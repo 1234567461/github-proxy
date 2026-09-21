@@ -1,0 +1,15 @@
+[Unit]
+Description=NovaOS Cloudflare Tunnel (github-proxy public access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/sh -c 'exec /usr/local/bin/cloudflared tunnel run --token "$(cat /opt/github-proxy/.cloudflared-token)"'
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

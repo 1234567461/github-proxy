@@ -1,0 +1,21 @@
+[Unit]
+Description=NovaOS GitHub reverse proxy (github-proxy v2.0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/github-proxy
+# Set UPSTREAM_PROXY here if the VPS cannot reach github.com directly,
+# e.g.  Environment=UPSTREAM_PROXY=http://127.0.0.1:7890
+Environment=PROXY_PORT=8081
+Environment=PROXY_HOST=0.0.0.0
+Environment=SELF_HOST=your-domain.com
+ExecStart=/usr/bin/python3 /opt/github-proxy/proxy.py
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

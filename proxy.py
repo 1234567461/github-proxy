@@ -26,6 +26,11 @@ GitHub 全站反向代理（单文件 Python 实现，无需 nginx / 无第三�
   - 重写 JSON 里转义形式的 https:\/\/... 链接
   - 健康检查端点 GET /__health__
   - 支持 GitHub 登录会话保持
+
+v2.1 登录链路修复：
+  - 保留全部多段 Set-Cookie（此前响应头去重会丢会话 cookie，登录必失败）
+  - Origin/Referer 反写为上游地址，通过 GitHub CSRF 同源校验（此前登录 POST 被 422 拒绝）
+  - 新增 login.github.com / alive.github.com 子域路由（2FA / 设备验证 / SSO 跳转）
 """
 import gzip
 import http.server
@@ -74,6 +79,8 @@ DOMAIN_ROUTES = {
     '__skills__':           'skills.github.com',
     '__education__':        'education.github.com',
     '__shop__':             'shop.github.com',
+    '__login__':            'login.github.com',
+    '__alive__':            'alive.github.com',
 }
 
 # 域名 -> 路径前缀（响应体重写用）。主站 github.com 前缀为空。
@@ -94,6 +101,8 @@ DOMAIN_TO_PREFIX = [
     ('skills.github.com',                         '__skills__'),
     ('education.github.com',                      '__education__'),
     ('shop.github.com',                           '__shop__'),
+    ('login.github.com',                          '__login__'),
+    ('alive.github.com',                          '__alive__'),
     ('github.com',                                ''),
 ]
 
@@ -220,6 +229,29 @@ def rewrite_location(loc, self_url, self_host):
     return loc
 
 
+def rewrite_to_upstream(url, self_url, self_host):
+    """把浏览器发给代理的 URL（Referer 等）反向还原成上游 URL，
+    供请求头重写使用。仅处理指向代理自身的 URL，其余原样返回。"""
+    rest = None
+    if url.startswith(self_url):
+        rest = url[len(self_url):]
+    elif url.startswith('//' + self_host):
+        rest = url[2 + len(self_host):]
+    elif url.startswith('http://' + self_host):
+        rest = url[7 + len(self_host):]
+    elif url.startswith('https://' + self_host):
+        rest = url[8 + len(self_host):]
+    else:
+        return url
+    for pfx, domain in DOMAIN_ROUTES.items():
+        full = '/' + pfx + '/'
+        if rest.startswith(full):
+            return 'https://{}{}'.format(domain, rest[len(full) - 1:])
+        if rest == '/' + pfx:
+            return 'https://{}/'.format(domain)
+    return 'https://github.com' + (rest if rest.startswith('/') else '/' + rest)
+
+
 def rewrite_cookie(cookie):
     """重写 Cookie：去掉 Domain 属性让 cookie 落到当前 host；
     去掉 Secure（http 代理下浏览器不会发送 Secure cookie）；
@@ -266,7 +298,7 @@ def upstream_request(req):
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    server_version = 'gh-mirror/2.0'
+    server_version = 'gh-mirror/2.1'
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[proxy] %s %s\n" % (self.address_string(), fmt % args))
@@ -315,7 +347,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 'uptime_s': round(time.time() - _start_ts, 1),
                 'cached_entries': len(_asset_cache),
                 'upstream_proxy': bool(UPSTREAM_PROXY),
-                'version': '2.0',
+                'version': '2.1',
             }).encode('utf-8')
             try:
                 self.send_response(200)
@@ -366,10 +398,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         url = 'https://{}{}'.format(upstream_host, upstream_path)
         req = urllib.request.Request(url, data=body, method=method)
+        # 浏览器发起的请求里，Origin/Referer 指向代理自身（例如
+        # http://localhost:8081）；GitHub 的 CSRF 校验要求与上游同源，
+        # 必须把它们反写成上游地址，否则登录 POST 会被 422 拒绝。
+        upstream_origin = 'https://{}'.format(upstream_host)
         for key, val in self.headers.items():
             k = key.lower()
             if k in DROP_REQ_HEADERS or k in HOP_BY_HOP:
                 continue
+            if k == 'origin':
+                val = upstream_origin
+            elif k == 'referer':
+                val = rewrite_to_upstream(val, self_url, self_host)
             try:
                 req.add_header(key, val)
             except Exception:
@@ -443,6 +483,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(status)
             sent = set()
             for k, val in resp_headers:
+                # Set-Cookie 必须全部回传：GitHub 登录响应会同时下发
+                # _gh_sess / logged_in / dotcom_user / host_user 等多段 cookie，
+                # 去重会丢掉会话 cookie 导致登录失效。
+                if k == 'set-cookie':
+                    self.send_header(k, val)
+                    continue
                 if k in sent:
                     continue
                 self.send_header(k, val)
@@ -462,7 +508,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
-    print('GitHub reverse proxy v2.0 (with login support)')
+    print('GitHub reverse proxy v2.1 (with login support)')
     print('  listening on  : http://{}:{} -> github.com'.format(
         LISTEN_HOST, LISTEN_PORT))
     print('  upstream proxy: {}'.format(UPSTREAM_PROXY or 'direct (no proxy)'))

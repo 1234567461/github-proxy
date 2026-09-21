@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.log
 nohup.out
+.cloudflared-token

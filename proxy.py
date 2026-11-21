@@ -275,14 +275,19 @@ def rewrite_text(text, self_url, self_host):
             proto_dst = '//' + self_host
         text = text.replace(https_src, https_dst)
         text = text.replace(proto_src, proto_dst)
-    # 2) JSON 转义形式 https:\/\/domain
-    for domain, prefix in DOMAIN_TO_PREFIX:
-        esc_src = 'https:\\/\\/' + domain
-        if prefix:
-            esc_dst = _esc(self_url) + '\\/' + prefix
-        else:
-            esc_dst = _esc(self_url)
-        text = text.replace(esc_src, esc_dst)
+        # 2) JSON 转义形式 https:\/\/domain
+        for domain, prefix in DOMAIN_TO_PREFIX:
+            esc_src = 'https:\\/\\/' + domain
+            if prefix:
+                esc_dst = _esc(self_url) + '\\/' + prefix
+            else:
+                esc_dst = _esc(self_url)
+            text = text.replace(esc_src, esc_dst)
+    # 3) 剥掉 SRI integrity 属性：URL 被我们改写过，原始 hash 必然对不上，
+    #    浏览器会因此拒绝执行全部 JS/CSS（GitHub 于是提示"Javascript 被阻挡"）
+    text = re.sub(r'\s+integrity\s*=\s*"[^"]*"', '', text, flags=re.I)
+    text = re.sub(r"\s+integrity\s*=\s*'[^']*'", '', text, flags=re.I)
+    text = re.sub(r'\s+integrity\s*=\s*[A-Za-z0-9_\-]+', '', text, flags=re.I)
     return text
 
 
@@ -417,6 +422,26 @@ def _drop_pool(host):
             conn.close()
         except Exception:
             pass
+
+
+# 回源限流：把对 GitHub 的请求节奏压到接近真人浏览，降低"速度异常"判定概率
+UPSTREAM_CONCURRENCY = int(os.environ.get('UPSTREAM_CONCURRENCY', '4'))
+UPSTREAM_MIN_INTERVAL = float(os.environ.get('UPSTREAM_MIN_INTERVAL', '0.12'))
+_upstream_sem = threading.BoundedSemaphore(UPSTREAM_CONCURRENCY)
+_rate_lock = threading.Lock()
+_last_upstream_ts = 0.0
+
+
+def throttled_request(req):
+    """带并发上限与最小间隔的上游请求。缓存命中的请求不经过这里，不受影响。"""
+    global _last_upstream_ts
+    with _upstream_sem:
+        with _rate_lock:
+            wait = UPSTREAM_MIN_INTERVAL - (time.time() - _last_upstream_ts)
+            if wait > 0:
+                time.sleep(wait)
+            _last_upstream_ts = time.time()
+        return upstream_request(req)
 
 
 def upstream_request(req):
@@ -603,7 +628,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         req.add_header('Accept-Encoding', 'gzip, deflate')
         req.add_header('User-Agent', self.headers.get('User-Agent') or UA)
 
-        resp, err = upstream_request(req)
+        resp, err = throttled_request(req)
         if err is not None:
             self._send_simple(502, 'upstream error: {}'.format(err))
             return
@@ -734,7 +759,7 @@ def _prefetch(host, path):
         req.add_header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8')
         req.add_header('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')
         req.add_header('User-Agent', UA)
-        resp, err = upstream_request(req)
+        resp, err = throttled_request(req)
         if err is not None or resp is None:
             return None
         raw = resp.read()

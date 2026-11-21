@@ -35,6 +35,7 @@ v2.1 登录链路修复：
 import gzip
 import http.server
 import os
+import http.client
 import re
 import socketserver
 import ssl
@@ -44,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from urllib.parse import urlsplit
 
 # ---------------- 配置（可由环境变量覆盖） ----------------
 LISTEN_HOST = os.environ.get('PROXY_HOST', '0.0.0.0')
@@ -52,14 +54,27 @@ LISTEN_PORT = int(os.environ.get('PROXY_PORT', '8081'))
 UPSTREAM_PROXY = os.environ.get('UPSTREAM_PROXY', '').strip()
 # 重写后 URL 的协议（默认 http，若挂在前端 https 反代后可设 https）
 SELF_SCHEME = os.environ.get('SELF_SCHEME', 'http').strip()
-DEFAULT_HOST = os.environ.get('SELF_HOST', 'localhost:{}'.format(LISTEN_PORT))
-TIMEOUT = float(os.environ.get('TIMEOUT', '60'))
-# 上游瞬时错误重试次数
+_SELF_HOST_ENV = os.environ.get('SELF_HOST', '').strip()
+DEFAULT_HOST = _SELF_HOST_ENV or 'localhost:{}'.format(LISTEN_PORT)
+# 显式设置 SELF_HOST 时强制用它重写，忽略请求里的 Host 头
+# （部署在反向代理/网关后面时，Host 会被网关改成内部地址，导致页面资源指向不可达域名）
+FORCE_SELF_HOST = bool(_SELF_HOST_ENV)
+TIMEOUT = float(os.environ.get('TIMEOUT', '18'))
+# 上游瞬时错误重试次数（含复用死连接的立即重连）
 RETRY_TIMES = int(os.environ.get('RETRY_TIMES', '3'))
 # 静态资源内存缓存（CACHE_DISABLE=1 可关）
 CACHE_ENABLED = os.environ.get('CACHE_DISABLE', '').lower() not in ('1', 'true', 'yes')
-CACHE_MAX = int(os.environ.get('CACHE_MAX', '2000'))
+CACHE_MAX = int(os.environ.get('CACHE_MAX', '3000'))
 CACHE_TTL = float(os.environ.get('CACHE_TTL', str(12 * 3600)))
+# 匿名页面（无 Cookie 的 GET）短缓存秒数，0 表示关闭
+HTML_CACHE_TTL = float(os.environ.get('HTML_CACHE_TTL', '120'))
+# 每个上游域名保留的空闲连接数（keep-alive 复用，省掉跨洋 TLS 握手）
+POOL_MAX_PER_HOST = int(os.environ.get('POOL_MAX_PER_HOST', '8'))
+POOL_IDLE_MAX = 90.0
+# 回传给浏览器的文本是否 gzip 压缩
+GZIP_OUT = os.environ.get('GZIP_OUT', '1').lower() not in ('0', 'false', 'no')
+# 启动时预热首页并预取静态资源
+WARMUP = os.environ.get('WARMUP', '1').lower() not in ('0', 'false', 'no')
 
 # 路径前缀 -> 上游域名（路由表）
 DOMAIN_ROUTES = {
@@ -144,6 +159,11 @@ CACHEABLE_CT_RE = re.compile(
     r'|font/|image/',
     re.I,
 )
+# 回传给浏览器时值得 gzip 的类型（上游压缩已被丢弃，不重压就是明文传输）
+COMPRESSIBLE_RE = re.compile(
+    r'text/|application/(json|javascript|xml|ecmascript|x-javascript)',
+    re.I,
+)
 
 UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
@@ -151,8 +171,12 @@ UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
 
 # ---------------- 内存缓存 ----------------
 _asset_cache = {}          # key -> (expire_ts, status, [(k,v)], body)
+_html_cache = {}           # key -> (expire_ts, status, [(k,v)], body)  匿名页面短缓存
 _cache_lock = threading.Lock()
 _start_ts = time.time()
+# 最近请求诊断：排查缓存未命中的真实原因（path / cookie / 命中结果）
+import collections
+_recent = collections.deque(maxlen=8)
 
 
 def _cache_key(upstream_host, upstream_path):
@@ -182,6 +206,53 @@ def cache_put(key, status, headers, body):
             except StopIteration:
                 pass
         _asset_cache[key] = (time.time() + CACHE_TTL, status, headers, body)
+
+
+# 真正的登录态标志。注意 _gh_sess 匿名访客也有、logged_in=no 也是匿名，
+# 都不能算登录，否则页面缓存永远写不进去。
+SESSION_COOKIE_RE = re.compile(r'user_session=|logged_in=yes', re.I)
+
+
+def _is_anon(cookie_header):
+    return not SESSION_COOKIE_RE.search(cookie_header or '')
+
+
+def _strip_gateway_params(path):
+    """去掉托管网关注入的鉴权参数（sharecode）。
+    它只对访问控制有意义，传给上游没用，还会让缓存 key 每次都不一样。"""
+    if 'sharecode=' not in path:
+        return path
+    base, sep, query = path.partition('?')
+    if not sep:
+        return path
+    kept = [p for p in query.split('&') if p and not p.startswith('sharecode=')]
+    return base + ('?' + '&'.join(kept) if kept else '')
+
+
+def html_cache_get(key):
+    if HTML_CACHE_TTL <= 0:
+        return None
+    with _cache_lock:
+        item = _html_cache.get(key)
+        if not item:
+            return None
+        expire_ts, status, headers, body = item
+        if expire_ts < time.time():
+            _html_cache.pop(key, None)
+            return None
+        return status, headers, body
+
+
+def html_cache_put(key, status, headers, body):
+    if HTML_CACHE_TTL <= 0 or not CACHE_ENABLED or status != 200:
+        return
+    with _cache_lock:
+        if len(_html_cache) >= 500:
+            try:
+                _html_cache.pop(next(iter(_html_cache)))
+            except StopIteration:
+                pass
+        _html_cache[key] = (time.time() + HTML_CACHE_TTL, status, headers, body)
 
 
 # ---------------- URL 重写 ----------------
@@ -265,34 +336,125 @@ def rewrite_cookie(cookie):
     return cookie.strip()
 
 
-def build_opener():
-    handlers = [urllib.request.HTTPSHandler(context=ssl._create_unverified_context())]
-    if UPSTREAM_PROXY:
-        handlers.insert(0, urllib.request.ProxyHandler({
-            'http': UPSTREAM_PROXY,
-            'https': UPSTREAM_PROXY,
-        }))
-    return urllib.request.build_opener(*handlers)
+_SSL_CTX = ssl._create_unverified_context()
+
+_PROXY = None
+if UPSTREAM_PROXY:
+    _PROXY = urlsplit(UPSTREAM_PROXY if '://' in UPSTREAM_PROXY else 'http://' + UPSTREAM_PROXY)
+
+# 上游连接池：host -> [(conn, idle_since_ts)]
+# 复用 keep-alive 连接，省掉每个资源一次跨洋 TLS 握手
+_conn_pool = {}
+_pool_lock = threading.Lock()
 
 
-OPENER = build_opener()
+class _Resp(object):
+    """轻量响应对象，接口与 urllib 的响应保持兼容。"""
+    __slots__ = ('status', 'code', 'headers', '_body')
+
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.code = status
+        self.headers = headers
+        self._body = body
+
+    def read(self, *args):
+        return self._body
+
+
+def _new_conn(host):
+    conn = http.client.HTTPSConnection(host, 443, timeout=TIMEOUT, context=_SSL_CTX)
+    if _PROXY:
+        tunnel_headers = {}
+        if _PROXY.username:
+            import base64
+            raw = '{}:{}'.format(_PROXY.username, _PROXY.password or '').encode('utf-8')
+            tunnel_headers['Proxy-Authorization'] = 'Basic ' + base64.b64encode(raw).decode('ascii')
+        conn.set_tunnel(_PROXY.hostname, _PROXY.port or 80, headers=tunnel_headers)
+    return conn
+
+
+def _take_conn(host):
+    now = time.time()
+    with _pool_lock:
+        lst = _conn_pool.get(host)
+        if lst:
+            while lst:
+                conn, ts = lst.pop()
+                if now - ts <= POOL_IDLE_MAX:
+                    return conn
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return _new_conn(host)
+
+
+def _give_conn(host, conn, reusable):
+    if not reusable:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    with _pool_lock:
+        lst = _conn_pool.setdefault(host, [])
+        if len(lst) < POOL_MAX_PER_HOST:
+            lst.append((conn, time.time()))
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _drop_pool(host):
+    """上游把空闲连接关掉后，池里的连接会变成死连接；一旦写失败就整池丢弃重建。"""
+    with _pool_lock:
+        lst = _conn_pool.pop(host, [])
+    for conn, _ in lst:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def upstream_request(req):
-    """请求上游，瞬时错误自动重试。返回 (resp, error)。"""
+    """请求上游，复用 keep-alive 连接，瞬时错误自动重试。返回 (resp, error)。"""
+    url = urlsplit(req.full_url)
+    host = url.hostname
+    path = url.path or '/'
+    if url.query:
+        path += '?' + url.query
+    method = (req.method or 'GET').upper()
+    hdrs = list(req.header_items())
+    body = req.data
+    last_err = None
+
     for attempt in range(RETRY_TIMES):
+        conn = _take_conn(host)
         try:
-            return OPENER.open(req, timeout=TIMEOUT), None
-        except urllib.error.HTTPError as e:
-            if getattr(e, 'code', 0) >= 500 and attempt < RETRY_TIMES - 1:
-                time.sleep(0.2 * (attempt + 1))
+            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            for k, v in hdrs:
+                conn.putheader(k, v)
+            conn.endheaders(message_body=body)
+            r = conn.getresponse()
+            data = r.read()
+            reusable = not r.will_close
+            _give_conn(host, conn, reusable)
+            if r.status >= 500 and attempt < RETRY_TIMES - 1:
+                time.sleep(0.15 * (attempt + 1))
                 continue
-            return e, None
+            return _Resp(r.status, r.headers, data), None
         except Exception as e:
+            last_err = e
+            _give_conn(host, conn, False)
+            _drop_pool(host)
             if attempt < RETRY_TIMES - 1:
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.15 * (attempt + 1))
             else:
                 return None, e
+    return None, last_err
     return None, None
 
 
@@ -312,6 +474,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self): self._handle('OPTIONS')
 
     def _self_urls(self):
+        if FORCE_SELF_HOST:
+            return ('{}://{}'.format(SELF_SCHEME, DEFAULT_HOST), DEFAULT_HOST)
         host = self.headers.get('Host') or DEFAULT_HOST
         return ('{}://{}'.format(SELF_SCHEME, host), host)
 
@@ -339,13 +503,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self_url, self_host = self._self_urls()
 
         # 健康检查端点
-        path_only = self.path.split('?', 1)[0]
+        clean_path = _strip_gateway_params(self.path)
+        path_only = clean_path.split('?', 1)[0]
         if path_only == '/__health__':
             import json
             payload = json.dumps({
                 'status': 'ok',
                 'uptime_s': round(time.time() - _start_ts, 1),
-                'cached_entries': len(_asset_cache),
+                'cached_entries': len(_asset_cache) + len(_html_cache),
+                'recent': list(_recent),
                 'upstream_proxy': bool(UPSTREAM_PROXY),
                 'version': '2.1',
             }).encode('utf-8')
@@ -361,17 +527,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # 解析路径前缀，确定上游域名；保留 query
         upstream_host = 'github.com'
-        upstream_path = self.path
+        upstream_path = clean_path
         for prefix, domain in DOMAIN_ROUTES.items():
             full_pfx = '/' + prefix
             if path_only == full_pfx:
                 upstream_host = domain
-                rest = self.path[len(full_pfx):]
+                rest = clean_path[len(full_pfx):]
                 upstream_path = '/' + rest if rest else '/'
                 break
             elif path_only.startswith(full_pfx + '/'):
                 upstream_host = domain
-                upstream_path = self.path[len(full_pfx):]
+                upstream_path = clean_path[len(full_pfx):]
                 break
         if not upstream_path.startswith('/'):
             upstream_path = '/' + upstream_path
@@ -393,8 +559,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             cached = cache_get(cache_key)
             if cached:
                 status, headers, out = cached
-                self._respond(status, headers, out, method)
+                self._send(status, headers, out, method)
                 return
+
+        # 匿名页面短缓存：未登录访客共享同一份已重写好的页面，二次打开免回源
+        html_key = None
+        if (method == 'GET' and HTML_CACHE_TTL > 0
+                and _is_anon(self.headers.get('Cookie'))):
+            html_key = 'html|' + _cache_key(upstream_host, upstream_path)
+            hit = html_cache_get(html_key)
+            _recent.append({
+                'p': upstream_path[:110], 'hit': 1 if hit else 0,
+                'ck': (self.headers.get('Cookie') or '')[:50]})
+            if hit:
+                status, hit_headers, out = hit
+                self._send(status, hit_headers, out, method)
+                return
+        else:
+            _recent.append({
+                'p': upstream_path[:110], 'hit': -1,
+                'ck': (self.headers.get('Cookie') or '')[:50]})
+            html_key = None
 
         url = 'https://{}{}'.format(upstream_host, upstream_path)
         req = urllib.request.Request(url, data=body, method=method)
@@ -476,6 +661,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 and CACHEABLE_CT_RE.search(ctype)):
             cache_put(cache_key, status, resp_headers, out)
 
+        # 匿名页面写入短缓存。GitHub 首页会下发 _gh_sess 这类匿名会话 cookie，
+        # 不能因为看到 Set-Cookie 就放弃缓存；只有真正的登录态 cookie 才排除。
+        if (html_key is not None and status == 200
+                and 'text/html' in ctype.lower()):
+            setck = ' '.join(v for k, v in resp_headers if k == 'set-cookie')
+            if not SESSION_COOKIE_RE.search(setck):
+                cache_headers = [(k, v) for k, v in resp_headers if k != 'set-cookie']
+                html_cache_put(html_key, status, cache_headers, out)
+
+        self._send(status, resp_headers, out, method)
+
+    def _send(self, status, resp_headers, out, method):
+        """回传前按需 gzip 压缩：上游压过的响应在解压重写后已变回明文，
+        不重新压缩等于把 550KB 原样推给浏览器。"""
+        if GZIP_OUT and method != 'HEAD' and len(out) >= 1024:
+            ae = (self.headers.get('Accept-Encoding') or '').lower()
+            if 'gzip' in ae:
+                ctype = ''
+                for k, v in resp_headers:
+                    if k.lower() == 'content-type':
+                        ctype = v
+                        break
+                if COMPRESSIBLE_RE.search(ctype or ''):
+                    try:
+                        packed = gzip.compress(out, 5)
+                        if len(packed) < len(out) * 0.95:
+                            resp_headers = [(k, v) for k, v in resp_headers
+                                            if k.lower() not in ('content-encoding', 'vary')]
+                            resp_headers.append(('content-encoding', 'gzip'))
+                            resp_headers.append(('vary', 'Accept-Encoding'))
+                            out = packed
+                    except Exception:
+                        pass
         self._respond(status, resp_headers, out, method)
 
     def _respond(self, status, resp_headers, out, method):
@@ -506,6 +724,102 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+# ---------------- 启动预热 ----------------
+def _prefetch(host, path):
+    """启动预热用：拉一个上游资源，返回 (resp, raw_body) 或 None。"""
+    try:
+        req = urllib.request.Request('https://{}{}'.format(host, path), method='GET')
+        req.add_header('Host', host)
+        req.add_header('Accept-Encoding', 'gzip, deflate')
+        req.add_header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8')
+        req.add_header('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')
+        req.add_header('User-Agent', UA)
+        resp, err = upstream_request(req)
+        if err is not None or resp is None:
+            return None
+        raw = resp.read()
+        ce = (resp.headers.get('Content-Encoding') or '').lower()
+        if ce == 'gzip' and raw:
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        elif ce == 'deflate' and raw:
+            try:
+                raw = zlib.decompress(raw)
+            except Exception:
+                pass
+        return resp, raw
+    except Exception:
+        return None
+
+
+def _clean_headers(resp):
+    out = []
+    for k, v in resp.headers.items():
+        kl = k.lower()
+        if kl in HOP_BY_HOP or kl in DROP_RESP_HEADERS or kl == 'set-cookie':
+            continue
+        out.append((kl, v))
+    return out
+
+
+def _warmup_job(self_url, self_host):
+    """预热首页 + 首屏静态资源，让第一个访客也能秒开。"""
+    page = _prefetch('github.com', '/')
+    if not page:
+        print('[warmup] 首页预热失败（上游不可达），跳过')
+        sys.stdout.flush()
+        return
+    resp, raw = page
+    try:
+        status = resp.status
+    except AttributeError:
+        status = getattr(resp, 'code', 200)
+    text = raw.decode('utf-8', errors='replace')
+    out = rewrite_text(text, self_url, self_host).encode('utf-8')
+    html_cache_put('html|github.com/', status, _clean_headers(resp), out)
+
+    # 原始 HTML 里资源可能写成绝对 URL，也可能是 /assets/ 相对路径，两种都收
+    seen = set()
+    for m in re.finditer(
+            r'''(?:https://github\.githubassets\.com)?/assets/[A-Za-z0-9_@.\-/]+\.(?:css|js)''',
+            text):
+        p = m.group(0)
+        if p.startswith('https://'):
+            p = p[len('https://github.githubassets.com'):]
+        if p not in seen:
+            seen.add(p)
+    paths = list(seen)[:80]
+    ok = [0]
+
+    def worker(sub):
+        try:
+            r = _prefetch('github.githubassets.com', sub)
+            if not r:
+                return
+            rr, body = r
+            if getattr(rr, 'status', 200) != 200:
+                return
+            ct = rr.headers.get('Content-Type', '')
+            if not CACHEABLE_CT_RE.search(ct):
+                return
+            cache_put(_cache_key('github.githubassets.com', sub), 200,
+                      _clean_headers(rr), body)
+            ok[0] += 1
+        except Exception:
+            pass
+
+    for i in range(0, len(paths), 6):
+        batch = [threading.Thread(target=worker, args=(p,)) for p in paths[i:i + 6]]
+        for t in batch:
+            t.start()
+        for t in batch:
+            t.join()
+    print('[warmup] 首页已缓存，静态资源预取 {}/{}'.format(ok[0], len(paths)))
+    sys.stdout.flush()
+
+
 def main():
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     print('GitHub reverse proxy v2.1 (with login support)')
@@ -518,7 +832,14 @@ def main():
     print('  retry times   : {}'.format(RETRY_TIMES))
     print('  routes        : github.com + {} sub-domains'.format(len(DOMAIN_ROUTES)))
     print('  login support : enabled (cookie domain rewritten)')
+    print('  page cache    : {:.0f}s  gzip out: {}  warmup: {}'.format(
+        HTML_CACHE_TTL, 'on' if GZIP_OUT else 'off', 'on' if WARMUP else 'off'))
     sys.stdout.flush()
+    if WARMUP:
+        threading.Thread(
+            target=_warmup_job,
+            args=('{}://{}'.format(SELF_SCHEME, DEFAULT_HOST), DEFAULT_HOST),
+            daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
